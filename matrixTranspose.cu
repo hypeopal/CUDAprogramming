@@ -1,6 +1,8 @@
 #include <iostream>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <vector>
+#include <numeric>
 
 #define TILE_SIZE 32
 const int matrixSize = 1024;
@@ -9,34 +11,23 @@ const int threadSize = 8;
 const int testTimes = 10;
 __constant__ int devMatrixSize;
 
-__global__ void matrixCopyInCol(int* newMatrix, const int* oldMatrix, int numPerThread) { //列优先
-	int x = blockIdx.x * gridDim.x + threadIdx.x;
-	int y = blockIdx.y * gridDim.y + threadIdx.y * numPerThread;
-	int i = 0;
-	while (i < numPerThread) {
-		newMatrix[(y + i) * devMatrixSize + x] = oldMatrix[(y + i) * devMatrixSize + x];
-		++i;
-	}
-}
-
-__global__ void matrixTransposeUsingSharedMem(const int* matrix, int* transposedMatrix) {
+__global__ void matrixTransposeUsingSharedMemWithPadding(const int* matrix, int* transposedMatrix) {
 	int x = blockIdx.x * gridDim.x + threadIdx.x;
 	int y = blockIdx.y * gridDim.y + threadIdx.y;
 
-	__shared__ int Tile[TILE_SIZE][TILE_SIZE];
+	__shared__ int Tile[(TILE_SIZE + 1) * TILE_SIZE];
 	for (int i = 0; i < TILE_SIZE; ++i) {
-		Tile[threadIdx.x][threadIdx.y + i] = matrix[(y + i) * devMatrixSize + x];
+		Tile[threadIdx.x * (TILE_SIZE + 1) + threadIdx.y + i] = matrix[(y + i) * devMatrixSize + x];
 	}
 
 	__syncthreads();
 
 	for (int i = 0; i < TILE_SIZE; ++i) {
-		transposedMatrix[x * devMatrixSize + (y + i)] = Tile[threadIdx.x][threadIdx.y + i];
+		transposedMatrix[x * devMatrixSize + (y + i)] = Tile[threadIdx.x * (TILE_SIZE + 1) + threadIdx.y + i];
 	}
 }
 
-cudaError_t cuda_check(const cudaError_t& error_code, int line)
-{
+cudaError_t cuda_check(const cudaError_t& error_code, int line) {
 	if (error_code != cudaSuccess)
 	{
 		printf("line: %d, error_code: %d, error_name: %s, error_description: %s\n",
@@ -65,6 +56,7 @@ bool checkResult(const int* matrix, const int* transposedMatrix) { //转置正�
 }
 
 void runCudaMatrixTranspose(const int* matrix, int* transposedMatrix) {
+	std::vector<float> resultList(testTimes);
 	//GPU内存分配
 	int size = sizeof(int) * matrixSize * matrixSize;
 	int* cudaOldMatrix;
@@ -83,15 +75,20 @@ void runCudaMatrixTranspose(const int* matrix, int* transposedMatrix) {
 	cuda_check(cudaEventCreate(&start), __LINE__);
 	cuda_check(cudaEventCreate(&stop), __LINE__);
 
-	cuda_check(cudaEventRecord(start, 0), __LINE__);
-	matrixTransposeUsingSharedMem << <dimGrid, dimBlock >> > (cudaOldMatrix, cudaTransposedMatrix);
-	cuda_check(cudaDeviceSynchronize(), __LINE__);
-	cuda_check(cudaEventRecord(stop, 0), __LINE__);
+	for (int i = 0; i < testTimes; ++i) {
+		cuda_check(cudaEventRecord(start, 0), __LINE__);
+		matrixTransposeUsingSharedMemWithPadding << <dimGrid, dimBlock >> > (cudaOldMatrix, cudaTransposedMatrix);
+		cuda_check(cudaDeviceSynchronize(), __LINE__);
+		cuda_check(cudaEventRecord(stop, 0), __LINE__);
 
-	cuda_check(cudaEventSynchronize(stop), __LINE__);
-	float gpuTime = 0;
-	cuda_check(cudaEventElapsedTime(&gpuTime, start, stop), __LINE__);
-	std::cout << "CUDA matrix transpose with shared memory runtime: " << gpuTime << std::endl;
+		cuda_check(cudaEventSynchronize(stop), __LINE__);
+		float gpuTime = 0;
+		cuda_check(cudaEventElapsedTime(&gpuTime, start, stop), __LINE__);
+		resultList[i] = gpuTime;
+	}
+	
+	std::cout << "CUDA matrix transpose with shared memory with padding average runtime: " 
+		<< std::accumulate(resultList.begin(), resultList.end(), 0.0) / testTimes << std::endl;
 
 	cuda_check(cudaMemcpy(transposedMatrix, cudaTransposedMatrix, size, cudaMemcpyDeviceToHost), __LINE__);
 	cuda_check(cudaFree(cudaTransposedMatrix), __LINE__);
